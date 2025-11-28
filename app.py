@@ -1,13 +1,16 @@
 """
 API d'extraction de texte PDF avec PyMuPDF
 Extraction rapide de texte depuis des PDF natifs (non scannés)
+Inclut PyMuPDF4LLM pour extraction Markdown structuree
 """
 
 from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
+import pymupdf4llm
 import io
 import base64
 import os
+import tempfile
 
 app = Flask(__name__)
 
@@ -16,14 +19,15 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "service": "PyMuPDF PDF Text Extraction API",
-        "version": "1.0.0",
-        "description": "Extraction rapide de texte depuis PDF natifs",
+        "version": "2.0.0",
+        "description": "Extraction de texte et Markdown structure depuis PDF natifs",
         "endpoints": {
-            "/extract": "POST - Extraire le texte d'un PDF",
-            "/info": "POST - Obtenir les métadonnées d'un PDF",
-            "/health": "GET - Vérifier l'état du service"
+            "/extract": "POST - Extraire le texte brut d'un PDF",
+            "/extract-markdown": "POST - Extraire le texte au format Markdown structure",
+            "/info": "POST - Obtenir les metadonnees d'un PDF",
+            "/health": "GET - Verifier l'etat du service"
         },
-        "note": "Pour les PDF scannés (images), utilisez Tesseract ou PaddleOCR"
+        "note": "Pour les PDF scannes (images), utilisez Marker API"
     })
 
 
@@ -142,6 +146,92 @@ def extract():
             "needs_ocr": pdf_type == "scanned",
             "pages_detail": result.get("pages_detail") if output_format == "blocks" else None
         })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+
+@app.route("/extract-markdown", methods=["POST"])
+def extract_markdown():
+    """
+    Extrait le texte d'un PDF natif au format Markdown structure.
+    Utilise PyMuPDF4LLM pour detecter les titres (via taille de police)
+    et generer une structure hierarchique avec #, ##, ###.
+
+    Accepte:
+    - multipart/form-data avec fichier 'file'
+    - JSON avec 'file' en base64
+
+    Retourne:
+    - markdown: Texte au format Markdown avec structure
+    - has_structure: True si des titres (#) ont ete detectes
+    - source: "pymupdf4llm"
+    """
+    try:
+        pdf_bytes = get_pdf_from_request()
+
+        if not pdf_bytes:
+            return jsonify({
+                "error": "Aucun fichier PDF fourni",
+                "usage": "Envoyez un PDF via 'file' (multipart) ou en base64 (JSON)"
+            }), 400
+
+        # Verifier d'abord si le PDF est natif ou scanne
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        native_score, pdf_type = is_native_pdf(doc)
+        total_pages = len(doc)
+        doc.close()
+
+        # Si PDF scanne, retourner une indication pour utiliser Marker
+        if pdf_type == "scanned":
+            return jsonify({
+                "success": True,
+                "markdown": "",
+                "source": "pymupdf4llm",
+                "has_structure": False,
+                "needs_ocr": True,
+                "pdf_type": pdf_type,
+                "native_score": round(native_score, 2),
+                "pages_count": total_pages,
+                "message": "PDF scanne detecte. Utilisez Marker API pour OCR + structure."
+            })
+
+        # Sauvegarder temporairement pour pymupdf4llm
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        try:
+            # Extraction avec structure markdown
+            markdown_text = pymupdf4llm.to_markdown(tmp_path)
+
+            # Compter les headers pour verifier la structure
+            h1_count = markdown_text.count('\n# ')
+            h2_count = markdown_text.count('\n## ')
+            h3_count = markdown_text.count('\n### ')
+            has_structure = (h1_count + h2_count + h3_count) > 0
+
+            return jsonify({
+                "success": True,
+                "markdown": markdown_text,
+                "source": "pymupdf4llm",
+                "has_structure": has_structure,
+                "needs_ocr": False,
+                "pdf_type": pdf_type,
+                "native_score": round(native_score, 2),
+                "pages_count": total_pages,
+                "structure_stats": {
+                    "h1_count": h1_count,
+                    "h2_count": h2_count,
+                    "h3_count": h3_count
+                }
+            })
+
+        finally:
+            os.unlink(tmp_path)
 
     except Exception as e:
         return jsonify({
