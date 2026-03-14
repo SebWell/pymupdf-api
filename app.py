@@ -12,6 +12,7 @@ import base64
 import os
 import gc
 import re
+import time
 import tempfile
 import requests as http_requests
 
@@ -29,6 +30,9 @@ OCR_PAGE_TIMEOUT = int(os.getenv("OCR_PAGE_TIMEOUT", "60"))
 
 # Seuil de pages pour reduire le DPI
 LARGE_PDF_THRESHOLD = int(os.getenv("LARGE_PDF_THRESHOLD", "30"))
+
+# Limite max de pages pour OCR scanned (au-dela, timeout infra)
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "80"))
 
 
 @app.route("/", methods=["GET"])
@@ -460,16 +464,25 @@ def ocr_scanned_pdf():
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         page_count = len(doc)
 
+        # Limiter le nombre de pages pour eviter les timeouts infra
+        pages_to_process = min(page_count, MAX_OCR_PAGES)
+        truncated = page_count > MAX_OCR_PAGES
+
         # DPI adaptatif
-        dpi = 150 if page_count > LARGE_PDF_THRESHOLD else 200
-        print(f"OCR scanned PDF: {page_count} pages, DPI={dpi}")
+        dpi = 150 if pages_to_process > LARGE_PDF_THRESHOLD else 200
+        if truncated:
+            print(f"OCR scanned PDF: {page_count} pages (tronque a {pages_to_process}), DPI={dpi}")
+        else:
+            print(f"OCR scanned PDF: {page_count} pages, DPI={dpi}")
 
         all_lines = []
         total_confidence = 0
         pages_processed = 0
         pages_failed = 0
 
-        for page_num in range(page_count):
+        start_time = time.time()
+
+        for page_num in range(pages_to_process):
             print(f"  Rendering page {page_num + 1}/{page_count}...")
             png_bytes = render_page_to_png(doc, page_num, dpi=dpi)
 
@@ -493,6 +506,9 @@ def ocr_scanned_pdf():
         doc.close()
         gc.collect()
 
+        elapsed = time.time() - start_time
+        print(f"OCR termine: {pages_processed}/{pages_to_process} pages en {elapsed:.1f}s")
+
         # Merge des resultats
         raw_text = "\n".join(all_lines)
         markdown_text = detect_structure_heuristics(raw_text)
@@ -503,7 +519,7 @@ def ocr_scanned_pdf():
         h3_count = len(re.findall(r'^### ', markdown_text, re.MULTILINE))
         has_structure = (h1_count + h2_count + h3_count) > 0
 
-        return jsonify({
+        result = {
             "success": True,
             "markdown": markdown_text,
             "text": raw_text,
@@ -515,12 +531,23 @@ def ocr_scanned_pdf():
             "pages_processed": pages_processed,
             "pages_failed": pages_failed,
             "is_pdf": True,
+            "processing_time_ms": int(elapsed * 1000),
             "structure_stats": {
                 "h1_count": h1_count,
                 "h2_count": h2_count,
                 "h3_count": h3_count
             }
-        })
+        }
+
+        if truncated:
+            result["truncated"] = True
+            result["truncated_message"] = (
+                f"PDF tronque: {pages_to_process}/{page_count} pages traitees "
+                f"(limite: {MAX_OCR_PAGES}). Les premieres pages contiennent "
+                f"generalement les informations essentielles."
+            )
+
+        return jsonify(result)
 
     except Exception as e:
         print(f"OCR scanned PDF error: {e}")
