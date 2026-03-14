@@ -10,24 +10,40 @@ import pymupdf4llm
 import io
 import base64
 import os
+import gc
+import re
 import tempfile
+import requests as http_requests
 
 app = Flask(__name__)
+
+# URL des services OCR (configurable via env vars)
+PADDLEOCR_URL = os.getenv("PADDLEOCR_URL", "http://paddleocr:5000")
+MARKER_URL = os.getenv("MARKER_URL", "http://marker:5000")
+
+# Batch size pour OCR page par page
+OCR_BATCH_SIZE = int(os.getenv("OCR_BATCH_SIZE", "10"))
+
+# Timeout par page pour PaddleOCR (secondes)
+OCR_PAGE_TIMEOUT = int(os.getenv("OCR_PAGE_TIMEOUT", "60"))
+
+# Seuil de pages pour reduire le DPI
+LARGE_PDF_THRESHOLD = int(os.getenv("LARGE_PDF_THRESHOLD", "30"))
 
 
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "service": "PyMuPDF PDF Text Extraction API",
-        "version": "2.0.0",
-        "description": "Extraction de texte et Markdown structure depuis PDF natifs",
+        "version": "3.0.0",
+        "description": "Extraction de texte et Markdown structure depuis PDFs natifs et scannes",
         "endpoints": {
             "/extract": "POST - Extraire le texte brut d'un PDF",
             "/extract-markdown": "POST - Extraire le texte au format Markdown structure",
+            "/ocr-scanned-pdf": "POST - OCR page par page (split + PaddleOCR par image + merge)",
             "/info": "POST - Obtenir les metadonnees d'un PDF",
             "/health": "GET - Verifier l'etat du service"
-        },
-        "note": "Pour les PDF scannes (images), utilisez Marker API"
+        }
     })
 
 
@@ -364,6 +380,151 @@ def extract_blocks(doc, pages):
         "text": "\n\n".join(all_text),
         "pages_detail": pages_detail
     }
+
+
+def render_page_to_png(doc, page_num, dpi=200):
+    """Rend une page PDF en bytes PNG."""
+    page = doc[page_num]
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat)
+    png_bytes = pix.tobytes("png")
+    del pix
+    return png_bytes
+
+
+def ocr_single_page(png_bytes, page_num, total_pages):
+    """Envoie une image PNG a PaddleOCR et retourne le resultat."""
+    try:
+        resp = http_requests.post(
+            f"{PADDLEOCR_URL}/ocr-markdown",
+            files={"image": (f"page_{page_num + 1}.png", png_bytes, "image/png")},
+            timeout=OCR_PAGE_TIMEOUT
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("success"):
+            return data
+        print(f"  PaddleOCR page {page_num + 1}: echec - {data.get('error', 'unknown')}")
+    except Exception as e:
+        print(f"  PaddleOCR page {page_num + 1}/{total_pages}: erreur - {e}")
+    return None
+
+
+def detect_structure_heuristics(text):
+    """Detecte les titres dans le texte OCR et ajoute les marqueurs markdown."""
+    lines = text.split('\n')
+    result = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            result.append(line)
+            continue
+
+        if (len(stripped) < 80 and len(stripped) > 3 and stripped.isupper() and
+                re.search(r'[A-Z\u00c0-\u00dc]', stripped)):
+            result.append(f"# {stripped}")
+            continue
+
+        if re.match(r'^(I{1,3}|IV|V|VI{1,3}|IX|X|XI{1,3}|XIV|XV)[.\s\-\u2013]', stripped):
+            result.append(f"## {stripped}")
+            continue
+
+        if re.match(r'^Article\s+\d+', stripped, re.IGNORECASE):
+            result.append(f"## {stripped}")
+            continue
+
+        if re.match(r'^\d{1,2}[.\/]\s+[A-Z\u00c0-\u00dc]', stripped) and len(stripped) < 100:
+            result.append(f"## {stripped}")
+            continue
+
+        result.append(line)
+
+    return '\n'.join(result)
+
+
+@app.route("/ocr-scanned-pdf", methods=["POST"])
+def ocr_scanned_pdf():
+    """
+    OCR un PDF scanne page par page.
+    Rend chaque page en image via PyMuPDF, puis envoie a PaddleOCR.
+    Merge les resultats de toutes les pages.
+
+    Retourne le meme format que PaddleOCR /ocr-markdown pour compatibilite n8n.
+    """
+    try:
+        pdf_bytes = get_pdf_from_request()
+        if not pdf_bytes:
+            return jsonify({"success": False, "error": "Aucun fichier PDF fourni"}), 400
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_count = len(doc)
+
+        # DPI adaptatif
+        dpi = 150 if page_count > LARGE_PDF_THRESHOLD else 200
+        print(f"OCR scanned PDF: {page_count} pages, DPI={dpi}")
+
+        all_lines = []
+        total_confidence = 0
+        pages_processed = 0
+        pages_failed = 0
+
+        for page_num in range(page_count):
+            print(f"  Rendering page {page_num + 1}/{page_count}...")
+            png_bytes = render_page_to_png(doc, page_num, dpi=dpi)
+
+            result = ocr_single_page(png_bytes, page_num, page_count)
+            del png_bytes
+
+            if result:
+                page_text = result.get("markdown") or result.get("text", "")
+                if page_text:
+                    all_lines.append(page_text)
+                total_confidence += result.get("confidence", 0)
+                pages_processed += 1
+            else:
+                pages_failed += 1
+
+            # Liberation memoire entre batches
+            if (page_num + 1) % OCR_BATCH_SIZE == 0:
+                gc.collect()
+                print(f"  Batch {(page_num + 1) // OCR_BATCH_SIZE} termine")
+
+        doc.close()
+        gc.collect()
+
+        # Merge des resultats
+        raw_text = "\n".join(all_lines)
+        markdown_text = detect_structure_heuristics(raw_text)
+        avg_confidence = (total_confidence / pages_processed) if pages_processed else 0
+
+        h1_count = len(re.findall(r'^# ', markdown_text, re.MULTILINE))
+        h2_count = len(re.findall(r'^## ', markdown_text, re.MULTILINE))
+        h3_count = len(re.findall(r'^### ', markdown_text, re.MULTILINE))
+        has_structure = (h1_count + h2_count + h3_count) > 0
+
+        return jsonify({
+            "success": True,
+            "markdown": markdown_text,
+            "text": raw_text,
+            "source": "pymupdf+paddleocr",
+            "has_structure": has_structure,
+            "confidence": round(avg_confidence, 2),
+            "lines_count": len(all_lines),
+            "page_count": page_count,
+            "pages_processed": pages_processed,
+            "pages_failed": pages_failed,
+            "is_pdf": True,
+            "structure_stats": {
+                "h1_count": h1_count,
+                "h2_count": h2_count,
+                "h3_count": h3_count
+            }
+        })
+
+    except Exception as e:
+        print(f"OCR scanned PDF error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":

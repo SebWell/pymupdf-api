@@ -2,3 +2,4 @@ flask==3.0.0
 PyMuPDF>=1.25.0
 pymupdf4llm>=0.0.17
 gunicorn==21.2.0
+requests>=2.31.0
