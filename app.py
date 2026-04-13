@@ -77,6 +77,20 @@ def get_pdf_from_request():
             file_data = file_data.split(",")[1]
         pdf_bytes = base64.b64decode(file_data)
 
+    # Option 3: URL dans JSON ou FormData — télécharger le fichier
+    elif request.is_json and "url" in request.json:
+        import requests as req
+        url = request.json["url"]
+        resp = req.get(url, timeout=120)
+        if resp.status_code == 200:
+            pdf_bytes = resp.content
+    elif "url" in request.form:
+        import requests as req
+        url = request.form["url"]
+        resp = req.get(url, timeout=120)
+        if resp.status_code == 200:
+            pdf_bytes = resp.content
+
     return pdf_bytes
 
 
